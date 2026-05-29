@@ -1,0 +1,421 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "click==8.3.3",
+#     "pyobjc-framework-Contacts==12.1; sys_platform == 'darwin'",
+# ]
+# ///
+"""Read your own iMessage / SMS history from the local Messages database.
+
+macOS Messages stores everything in a SQLite database at
+`~/Library/Messages/chat.db`; AppleScript can no longer read message text, so
+this CLI goes straight to that database (read-only) instead. It is the iMessage
+counterpart to the WhatsApp/Slack personal CLIs: list conversations, read a
+thread, search across messages.
+
+Two macOS specifics drive the design:
+
+* **Full Disk Access.** `chat.db` is TCC-protected. The terminal app running
+  this command (e.g. iTerm) must be granted Full Disk Access, otherwise every
+  query fails with "authorization denied".
+* **WAL + text encoding.** The DB uses write-ahead logging while Messages is
+  live, and recent macOS stores body text in the `attributedBody` blob rather
+  than the `text` column. We snapshot the DB files to a temp dir before reading,
+  and decode `attributedBody` when `text` is empty.
+
+Contact names are resolved best-effort via the Contacts framework; if that
+permission is absent the raw handle (phone/email) is shown instead.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import click
+
+logging.basicConfig(
+    level=logging.WARNING, format="%(levelname)s: %(message)s", stream=sys.stderr
+)
+log = logging.getLogger("imsg")
+
+CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
+# Apple absolute time (seconds since 2001-01-01) → Unix epoch offset.
+APPLE_EPOCH = 978307200
+
+
+def _snapshot_db() -> Path:
+    """Copy chat.db (+ WAL/SHM sidecars) to a temp dir and return the copy.
+
+    Reading the live DB risks lock contention with Messages and a half-applied
+    WAL; a private copy sidesteps both and lets SQLite checkpoint freely.
+    """
+    if not CHAT_DB.exists():
+        raise click.ClickException(f"{CHAT_DB} not found — is this macOS Messages?")
+    if not _readable(CHAT_DB):
+        raise click.ClickException(
+            "chat.db is not readable: grant the terminal app (iTerm/Terminal) "
+            "Full Disk Access in System Settings → Privacy & Security, then "
+            "restart it."
+        )
+    tmp = Path(tempfile.mkdtemp(prefix="imsg-"))
+    for suffix in ["", "-wal", "-shm"]:
+        src = CHAT_DB.with_name(CHAT_DB.name + suffix)
+        if src.exists():
+            shutil.copy2(src, tmp / src.name)
+    return tmp / CHAT_DB.name
+
+
+def _readable(path: Path) -> bool:
+    try:
+        with path.open("rb"):
+            return True
+    except OSError:
+        return False
+
+
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(_snapshot_db()))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# Message body text lives in `attributedBody` (a NeXT `streamtyped` archive) when
+# the plain `text` column is null. The readable string follows the "NSString"
+# class marker and a short framing sequence ending in '+', then a length prefix.
+def _decode_attributed_body(blob: bytes | None) -> str | None:
+    if not blob:
+        return None
+    marker = blob.find(b"NSString")
+    if marker == -1:
+        return None
+    plus = blob.find(b"+", marker)
+    if plus == -1 or plus + 1 >= len(blob):
+        return None
+    q = plus + 1
+    length = blob[q]
+    q += 1
+    if length == 0x81:  # 2-byte little-endian length
+        length = int.from_bytes(blob[q : q + 2], "little")
+        q += 2
+    elif length == 0x82:  # 4-byte little-endian length
+        length = int.from_bytes(blob[q : q + 4], "little")
+        q += 4
+    text = blob[q : q + length].decode("utf-8", errors="replace")
+    return text or None
+
+
+def _body(row: sqlite3.Row) -> str:
+    if row["text"]:
+        return row["text"]
+    decoded = _decode_attributed_body(row["attributedBody"])
+    if decoded:
+        return decoded
+    if row["cache_has_attachments"]:
+        return "[attachment]"
+    return ""
+
+
+def _digits(handle: str) -> str:
+    """Last 10 digits of a phone handle, for tolerant cross-format matching."""
+    return re.sub(r"\D", "", handle)[-10:]
+
+
+def _contact_map() -> dict[str, str]:
+    """Best-effort handle → display name map from the Contacts framework.
+
+    Returns an empty map (never raises) if Contacts access is unavailable, so
+    message reading degrades to showing raw handles.
+    """
+    mapping: dict[str, str] = {}
+    try:
+        import Contacts  # pyobjc
+
+        store = Contacts.CNContactStore.alloc().init()
+        keys = [
+            Contacts.CNContactGivenNameKey,
+            Contacts.CNContactFamilyNameKey,
+            Contacts.CNContactPhoneNumbersKey,
+            Contacts.CNContactEmailAddressesKey,
+        ]
+        request = Contacts.CNContactFetchRequest.alloc().initWithKeysToFetch_(keys)
+        collected: list = []
+
+        def _handler(contact, _stop):
+            name = " ".join(
+                p for p in [contact.givenName(), contact.familyName()] if p
+            ).strip()
+            if not name:
+                return
+            for phone in contact.phoneNumbers():
+                num = phone.value().stringValue()
+                mapping.setdefault(_digits(num), name)
+            for email in contact.emailAddresses():
+                mapping.setdefault(str(email.value()).lower(), name)
+            collected.append(contact)
+
+        store.enumerateContactsWithFetchRequest_error_usingBlock_(
+            request, None, _handler
+        )
+    except Exception as exc:  # noqa: BLE001 — Contacts is optional, never fatal
+        log.debug("contact resolution unavailable: %s", exc)
+    return mapping
+
+
+def _resolve(handle: str, contacts: dict[str, str]) -> str:
+    if not handle:
+        return "me"
+    if "@" in handle:
+        return contacts.get(handle.lower(), handle)
+    return contacts.get(_digits(handle), handle)
+
+
+def _chats(conn: sqlite3.Connection) -> list[dict]:
+    """All chats with their member handles and last-activity timestamp."""
+    rows = conn.execute(
+        """
+        SELECT c.ROWID AS id, c.chat_identifier AS ident, c.display_name AS display,
+               MAX(m.date) AS last_date,
+               datetime(MAX(m.date)/1000000000 + ?, 'unixepoch', 'localtime') AS last_fmt
+        FROM chat c
+        JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+        JOIN message m ON m.ROWID = cmj.message_id
+        GROUP BY c.ROWID
+        ORDER BY last_date DESC
+        """,
+        (APPLE_EPOCH,),
+    ).fetchall()
+    handles: dict[int, list[str]] = {}
+    for r in conn.execute(
+        """
+        SELECT chj.chat_id AS cid, h.id AS handle
+        FROM chat_handle_join chj JOIN handle h ON h.ROWID = chj.handle_id
+        """
+    ):
+        handles.setdefault(r["cid"], []).append(r["handle"])
+    return [
+        {
+            "id": r["id"],
+            "ident": r["ident"],
+            "display": r["display"],
+            "last_fmt": r["last_fmt"],
+            "handles": handles.get(r["id"], []),
+        }
+        for r in rows
+    ]
+
+
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+def cli() -> None:
+    """Read your local iMessage / SMS history (read-only)."""
+
+
+@cli.command()
+@click.option("--limit", default=30, help="Number of conversations to list.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def chats(limit: int, as_json: bool) -> None:
+    """List conversations, most recent first."""
+    conn = _connect()
+    contacts = _contact_map()
+    rows = _chats(conn)[:limit]
+    out = []
+    for c in rows:
+        name = c["display"] or ", ".join(
+            _resolve(h, contacts) for h in c["handles"]
+        ) or c["ident"]
+        out.append({"last": c["last_fmt"], "name": name, "ident": c["ident"]})
+    if as_json:
+        click.echo(json.dumps(out, ensure_ascii=False))
+        return
+    for c in out:
+        click.echo(f"{c['last']}  {c['name']}")
+
+
+@cli.command()
+@click.argument("query")
+@click.option("--limit", default=50, help="Number of messages to show.")
+@click.option("--match", default=0, help="Pick the Nth match when ambiguous (1-based).")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def read(query: str, limit: int, match: int, as_json: bool) -> None:
+    """Read messages from the chat best matching QUERY (name, handle, or group)."""
+    conn = _connect()
+    contacts = _contact_map()
+    needle = query.lower()
+
+    def matches(c: dict) -> bool:
+        fields = [c["display"] or "", c["ident"] or "", *c["handles"]]
+        fields += [_resolve(h, contacts) for h in c["handles"]]
+        return any(needle in f.lower() for f in fields)
+
+    candidates = [c for c in _chats(conn) if matches(c)]
+    if not candidates:
+        raise click.ClickException(f"No conversation matches {query!r}.")
+    if len(candidates) > 1 and not match:
+        click.echo(f"Multiple matches for {query!r} — pick with --match N:", err=True)
+        for i, c in enumerate(candidates[:20], 1):
+            label = c["display"] or ", ".join(
+                _resolve(h, contacts) for h in c["handles"]
+            ) or c["ident"]
+            click.echo(f"  {i}. {label}  ({c['last_fmt']})", err=True)
+        raise SystemExit(1)
+    chat = candidates[match - 1 if match else 0]
+
+    rows = conn.execute(
+        """
+        SELECT datetime(m.date/1000000000 + ?, 'unixepoch', 'localtime') AS ts,
+               m.is_from_me AS mine, h.id AS handle,
+               m.text, m.attributedBody, m.cache_has_attachments
+        FROM message m
+        JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+        LEFT JOIN handle h ON h.ROWID = m.handle_id
+        WHERE cmj.chat_id = ?
+        ORDER BY m.date DESC
+        LIMIT ?
+        """,
+        (APPLE_EPOCH, chat["id"], limit),
+    ).fetchall()
+    rows = list(reversed(rows))
+
+    out = []
+    for r in rows:
+        sender = "me" if r["mine"] else _resolve(r["handle"], contacts)
+        out.append({"ts": r["ts"], "sender": sender, "text": _body(r)})
+    if as_json:
+        click.echo(json.dumps(out, ensure_ascii=False))
+        return
+    title = chat["display"] or ", ".join(
+        _resolve(h, contacts) for h in chat["handles"]
+    ) or chat["ident"]
+    click.echo(f"# {title} — {len(out)} messages\n")
+    for m in out:
+        click.echo(f"{m['ts']}  {m['sender']}: {m['text']}")
+
+
+@cli.command()
+@click.argument("text")
+@click.option("--limit", default=50, help="Number of matches to show.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def search(text: str, limit: int, as_json: bool) -> None:
+    """Full-text search across all messages."""
+    conn = _connect()
+    contacts = _contact_map()
+    rows = conn.execute(
+        """
+        SELECT datetime(m.date/1000000000 + ?, 'unixepoch', 'localtime') AS ts,
+               m.is_from_me AS mine, h.id AS handle, m.text, m.attributedBody,
+               m.cache_has_attachments
+        FROM message m
+        LEFT JOIN handle h ON h.ROWID = m.handle_id
+        WHERE m.text LIKE ?
+        ORDER BY m.date DESC
+        LIMIT ?
+        """,
+        (APPLE_EPOCH, f"%{text}%", limit),
+    ).fetchall()
+    out = [
+        {
+            "ts": r["ts"],
+            "sender": "me" if r["mine"] else _resolve(r["handle"], contacts),
+            "text": _body(r),
+        }
+        for r in rows
+    ]
+    if as_json:
+        click.echo(json.dumps(out, ensure_ascii=False))
+        return
+    for m in out:
+        click.echo(f"{m['ts']}  {m['sender']}: {m['text']}")
+
+
+def _applescript_quote(text: str) -> str:
+    """Escape a Python string for embedding in an AppleScript string literal."""
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    # AppleScript string literals can't span raw newlines; splice in `linefeed`.
+    return escaped.replace("\n", '" & linefeed & "')
+
+
+def _matching_chats(conn: sqlite3.Connection, needle: str, contacts: dict) -> list[dict]:
+    def hit(c: dict) -> bool:
+        fields = [c["display"] or "", c["ident"] or "", *c["handles"]]
+        fields += [_resolve(h, contacts) for h in c["handles"]]
+        return any(needle in f.lower() for f in fields)
+
+    return [c for c in _chats(conn) if hit(c)]
+
+
+@cli.command()
+@click.argument("query")
+@click.argument("text")
+@click.option("--handle", "handle_override", help="Send to this exact handle, skipping query resolution.")
+@click.option("--match", default=0, help="Pick the Nth matching chat when ambiguous (1-based).")
+@click.option("--yes", is_flag=True, help="Actually send. Without it, prints a dry-run only.")
+@click.option("--sms", is_flag=True, help="Send over SMS instead of iMessage.")
+def send(
+    query: str, text: str, handle_override: str | None, match: int, yes: bool, sms: bool
+) -> None:
+    """Send an iMessage/SMS to the contact matching QUERY.
+
+    Defaults to a dry-run that prints the resolved recipient and text without
+    sending. Pass --yes to actually send — an outbound action the calling agent
+    must confirm with the user first.
+    """
+    if handle_override:
+        handle = handle_override
+        label = handle
+    else:
+        conn = _connect()
+        contacts = _contact_map()
+        # Only 1:1 chats (a single member handle) have an unambiguous recipient.
+        cands = [
+            c
+            for c in _matching_chats(conn, query.lower(), contacts)
+            if len(c["handles"]) == 1
+        ]
+        if not cands:
+            raise click.ClickException(
+                f"No 1:1 conversation matches {query!r}. Pass --handle to be explicit."
+            )
+        if len(cands) > 1 and not match:
+            click.echo(f"Multiple matches for {query!r} — pick with --match N:", err=True)
+            for i, c in enumerate(cands[:20], 1):
+                click.echo(
+                    f"  {i}. {_resolve(c['handles'][0], contacts)}  <{c['handles'][0]}>",
+                    err=True,
+                )
+            raise SystemExit(1)
+        chosen = cands[match - 1 if match else 0]
+        handle = chosen["handles"][0]
+        label = _resolve(handle, contacts)
+
+    service = "SMS" if sms else "iMessage"
+    if not yes:
+        click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
+        click.echo(f"  to:      {label} <{handle}>  via {service}")
+        click.echo(f"  message: {text}")
+        return
+
+    script = (
+        'tell application "Messages"\n'
+        f"  set svc to 1st account whose service type = {service}\n"
+        f'  set theBuddy to participant "{handle}" of svc\n'
+        f'  send "{_applescript_quote(text)}" to theBuddy\n'
+        "end tell"
+    )
+    result = subprocess.run(
+        ["osascript", "-e", script], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise click.ClickException(result.stderr.strip() or "osascript send failed")
+    click.echo(f"Sent to {label} <{handle}> via {service}.")
+
+
+if __name__ == "__main__":
+    cli()
