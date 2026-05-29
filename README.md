@@ -10,9 +10,9 @@ imsg search "dinner"          # full-text search across all messages
 imsg send "alice" "hi" --yes  # send a 1:1 message (dry-run without --yes)
 ```
 
-This is the iMessage counterpart to `whatsapp-cli` / `slack-user-cli`. Recent
-macOS removed message-text reading from the Messages scripting dictionary (it
-only exposes `send`), so the SQLite store is the only way to read history — the
+Recent macOS removed message-text reading from the Messages scripting
+dictionary (it only exposes `send`), so the SQLite store is the only way to read
+history — the
 CLI snapshots `chat.db` (plus its WAL/SHM sidecars) to a temp dir and queries
 the copy, so it never locks or mutates the live database.
 
@@ -125,3 +125,12 @@ Single-user personal tooling for **your own** account on **your own** Mac. It
 reads a local, TCC-protected database you already have access to — there is no
 network service, no account registration, and no way to read anyone else's
 messages. macOS only.
+
+## See also
+
+Same idea — your own messages, from the terminal, for other platforms:
+
+- [whatsapp-cli](https://github.com/ClementWalter/whatsapp-cli) — your personal
+  WhatsApp chats (pairs as a linked device)
+- [slack-user-cli](https://github.com/ClementWalter/slack-user-cli) — Slack via
+  your existing browser session credentials

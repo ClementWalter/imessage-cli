@@ -15,8 +15,7 @@ description:
 # iMessage reader CLI
 
 Terminal access to your **own** iMessage / SMS history by reading the local
-Messages database (`~/Library/Messages/chat.db`) read-only. This is the iMessage
-counterpart to `whatsapp-cli` / `slack-user-cli`.
+Messages database (`~/Library/Messages/chat.db`) read-only.
 
 Why a database reader and not AppleScript: recent macOS removed message-text
 reading from the Messages scripting dictionary (it only exposes `send`), so the
