@@ -30,6 +30,7 @@ permission is absent the raw handle (phone/email) is shown instead.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import re
@@ -38,6 +39,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import click
@@ -50,13 +52,37 @@ log = logging.getLogger("imsg")
 CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
 # Apple absolute time (seconds since 2001-01-01) → Unix epoch offset.
 APPLE_EPOCH = 978307200
+# Snapshot temp dirs share this prefix so they can be recognised and swept.
+_SNAPSHOT_PREFIX = "imsg-"
+# A snapshot older than this is certainly abandoned (a run finishes in
+# seconds), so sweeping it can never race a live concurrent invocation.
+_SNAPSHOT_STALE_SECONDS = 3600
+
+
+def _sweep_stale_snapshots() -> None:
+    """Delete snapshot dirs left by earlier runs that exited before cleanup.
+
+    chat.db is large (hundreds of MB); without this, every crashed or killed
+    invocation would leak a full copy forever. Bounded by mtime age so a
+    snapshot a concurrent run is still reading is never removed. Best-effort:
+    permission/races on individual dirs are ignored.
+    """
+    root = Path(tempfile.gettempdir())
+    cutoff = time.time() - _SNAPSHOT_STALE_SECONDS
+    for entry in root.glob(f"{_SNAPSHOT_PREFIX}*"):
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError as exc:  # noqa: PERF203 — one bad entry mustn't abort the sweep
+            log.debug("could not sweep %s: %s", entry, exc)
 
 
 def _snapshot_db() -> Path:
     """Copy chat.db (+ WAL/SHM sidecars) to a temp dir and return the copy.
 
     Reading the live DB risks lock contention with Messages and a half-applied
-    WAL; a private copy sidesteps both and lets SQLite checkpoint freely.
+    WAL; a private copy sidesteps both and lets SQLite checkpoint freely. The
+    copy is registered for deletion at process exit so it does not accumulate.
     """
     if not CHAT_DB.exists():
         raise click.ClickException(f"{CHAT_DB} not found — is this macOS Messages?")
@@ -66,7 +92,11 @@ def _snapshot_db() -> Path:
             "Full Disk Access in System Settings → Privacy & Security, then "
             "restart it."
         )
-    tmp = Path(tempfile.mkdtemp(prefix="imsg-"))
+    _sweep_stale_snapshots()
+    tmp = Path(tempfile.mkdtemp(prefix=_SNAPSHOT_PREFIX))
+    # Remove this run's copy on exit — covers normal exit, ClickException, and
+    # SystemExit alike, so a ~195 MB chat.db copy is never left behind.
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     for suffix in ["", "-wal", "-shm"]:
         src = CHAT_DB.with_name(CHAT_DB.name + suffix)
         if src.exists():
