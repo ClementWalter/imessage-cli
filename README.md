@@ -45,7 +45,7 @@ runs the command** Full Disk Access, or every command fails with
 
 ## Install
 
-**A — Bundled launcher.** No install step. Clone the repo and invoke `bin/imsg`
+**A — Bundled launcher.** No install step. Clone the repo and invoke `imsg`
 directly; the `#!/usr/bin/env -S uv run --script` shebang and
 [PEP 723](https://peps.python.org/pep-0723/) inline metadata make `uv` pull
 deps on the first run.
@@ -57,7 +57,7 @@ cd imessage-cli
 ```
 
 **B — As an agent skill.** The repo ships a `SKILL.md` and the self-contained
-`bin/imsg` launcher at the project root, in the
+`imsg` launcher at the project root, in the
 [Vercel Labs `skills`](https://github.com/vercel-labs/skills) format:
 
 ```bash
@@ -67,7 +67,7 @@ npx skills add ClementWalter/imessage-cli
 This drops the skill under `~/.agents/skills/imessage-cli/` and symlinks it into
 every supported agent runtime installed on your machine (Claude Code, Cursor,
 Windsurf, Codex, Gemini CLI, …). Agents then drive the CLI by invoking the
-bundled `bin/imsg` script directly.
+bundled `imsg` script directly.
 
 To install locally for development instead, symlink the checkout so the skill
 picks up live edits:
@@ -112,7 +112,7 @@ outbound action: it **defaults to a dry-run** and only sends with `--yes`.
 
 ## Dependencies
 
-Declared inline via PEP 723 in `bin/imsg`:
+Declared inline via PEP 723 in `imsg`:
 
 - `click` — CLI framework
 - `pyobjc-framework-Contacts` — macOS-only, resolves handles to contact names
