@@ -2,7 +2,7 @@
 name: imessage-cli
 description:
   "Read your own iMessage / SMS history from the terminal via the bundled
-  `bin/imsg` command. Reads the local Messages SQLite database
+  `imsg` command. Reads the local Messages SQLite database
   (`~/Library/Messages/chat.db`) directly, since AppleScript can no longer read
   message text. `imsg chats` lists conversations, `imsg read <name>` shows a
   thread, `imsg search <text>` searches across messages, `imsg send <name>
@@ -23,9 +23,21 @@ SQLite store is the only way to read history.
 
 ## How to invoke
 
-Run the bundled launcher **`bin/imsg`** (PEP 723 — `uv` resolves deps inline on
-first run). Resolve `bin/imsg` against this skill's directory; from elsewhere
-use the absolute path.
+Invoke it as **`imsg`** — on `$PATH` via a symlink in `~/.local/bin` onto this
+repo's `bin/imsg`, so it always runs the current checkout: a `git pull`, or even
+an uncommitted edit, takes effect immediately with nothing to reinstall.
+
+```bash
+imsg chats
+```
+
+Examples in this doc are written that way. If `imsg` is not on `$PATH`, run the
+bundled launcher `bin/imsg` resolved against this skill's own directory (PEP 723
+— `uv` resolves deps inline on first run), or link it once:
+
+```bash
+ln -sfn <skill-dir>/bin/imsg ~/.local/bin/imsg
+```
 
 ## Prerequisite: Full Disk Access (one-time)
 
@@ -64,10 +76,10 @@ handle, or group name). If several chats match, it prints a numbered list — pi
 one with `--match N`.
 
 ```bash
-bin/imsg read jason            # most likely "Jason" thread
-bin/imsg read jason --match 2  # 2nd match when ambiguous
-bin/imsg read "+33612345678"   # by handle
-bin/imsg read "Family" --limit 200
+imsg read jason            # most likely "Jason" thread
+imsg read jason --match 2  # 2nd match when ambiguous
+imsg read "+33612345678"   # by handle
+imsg read "Family" --limit 200
 ```
 
 ### `imsg search <text> [--limit N] [--json]`
@@ -83,8 +95,8 @@ matches print a numbered list — pick with `--match N`, or target a raw handle
 with `--handle`. `--sms` sends over SMS instead of iMessage.
 
 ```bash
-bin/imsg send jason "running late"          # dry-run: shows recipient + text
-bin/imsg send jason "running late" --yes    # actually sends
+imsg send jason "running late"          # dry-run: shows recipient + text
+imsg send jason "running late" --yes    # actually sends
 ```
 
 ## Notes
