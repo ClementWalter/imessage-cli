@@ -31,6 +31,7 @@ permission is absent the raw handle (phone/email) is shown instead.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import re
@@ -57,6 +58,16 @@ _SNAPSHOT_PREFIX = "imsg-"
 # A snapshot older than this is certainly abandoned (a run finishes in
 # seconds), so sweeping it can never race a live concurrent invocation.
 _SNAPSHOT_STALE_SECONDS = 3600
+
+# Attachments are copied out here so a caller can Read() them after this
+# process exits — unlike the chat.db snapshot, these must NOT be deleted at
+# exit. Swept lazily instead (see _sweep_stale_attachment_cache).
+ATTACHMENT_CACHE_DIR = Path(tempfile.gettempdir()) / "imsg-attachments"
+_ATTACHMENT_STALE_SECONDS = 24 * 3600
+# HEIC/HEIF (the iPhone default) is not a format most image readers accept;
+# normalize every image-like attachment to JPEG via `sips` so it is always
+# directly viewable, not just for HEIC.
+_IMAGE_EXTS = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".gif", ".tiff", ".tif", ".bmp", ".webp"}
 
 
 def _sweep_stale_snapshots() -> None:
@@ -118,6 +129,88 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _sweep_stale_attachment_cache() -> None:
+    """Delete cached attachment copies older than a day.
+
+    Unlike the chat.db snapshot these outlive the process on purpose (a
+    caller reads them after this command exits), so they're swept by age at
+    the start of the next run instead of at exit.
+    """
+    if not ATTACHMENT_CACHE_DIR.exists():
+        return
+    cutoff = time.time() - _ATTACHMENT_STALE_SECONDS
+    for entry in ATTACHMENT_CACHE_DIR.iterdir():
+        try:
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                entry.unlink()
+        except OSError as exc:  # noqa: PERF203 — one bad entry mustn't abort the sweep
+            log.debug("could not sweep attachment cache %s: %s", entry, exc)
+
+
+def _fetch_attachments(conn: sqlite3.Connection, mids: list[int]) -> dict[int, list[dict]]:
+    """Batch-fetch attachment rows for a set of message ROWIDs."""
+    if not mids:
+        return {}
+    placeholders = ",".join("?" for _ in mids)
+    rows = conn.execute(
+        f"""
+        SELECT maj.message_id AS mid, a.filename AS path, a.mime_type AS mime,
+               a.transfer_name AS name
+        FROM message_attachment_join maj
+        JOIN attachment a ON a.ROWID = maj.attachment_id
+        WHERE maj.message_id IN ({placeholders})
+        """,
+        mids,
+    ).fetchall()
+    out: dict[int, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r["mid"], []).append(
+            {"path": r["path"], "mime": r["mime"], "name": r["name"]}
+        )
+    return out
+
+
+def _resolve_attachment(entry: dict) -> dict | None:
+    """Copy (and, for images, normalize to JPEG) one attachment into the
+    readable cache dir. Returns None if the source file isn't on disk (e.g.
+    offloaded to iCloud and never downloaded) — an honest gap, not a guess.
+    """
+    raw = entry.get("path")
+    if not raw:
+        return None
+    src = Path(raw).expanduser()
+    if not src.exists():
+        return None
+    ATTACHMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(str(src).encode()).hexdigest()[:20]
+    if src.suffix.lower() in _IMAGE_EXTS:
+        dst = ATTACHMENT_CACHE_DIR / f"{key}.jpg"
+        if not dst.exists():
+            result = subprocess.run(
+                ["sips", "-s", "format", "jpeg", str(src), "--out", str(dst)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0 or not dst.exists():
+                log.debug("sips conversion failed for %s: %s", src, result.stderr)
+                return None
+        kind = "image"
+    else:
+        dst = ATTACHMENT_CACHE_DIR / f"{key}{src.suffix}"
+        if not dst.exists():
+            try:
+                shutil.copy2(src, dst)
+            except OSError as exc:
+                log.debug("copy failed for %s: %s", src, exc)
+                return None
+        kind = "file"
+    return {"path": str(dst), "kind": kind, "name": entry.get("name") or src.name}
+
+
+def _attachment_tag(a: dict) -> str:
+    return f"[{a['kind']}: {a['path']}]"
+
+
 # Message body text lives in `attributedBody` (a NeXT `streamtyped` archive) when
 # the plain `text` column is null. The readable string follows the "NSString"
 # class marker and a short framing sequence ending in '+', then a length prefix.
@@ -143,14 +236,17 @@ def _decode_attributed_body(blob: bytes | None) -> str | None:
     return text or None
 
 
-def _body(row: sqlite3.Row) -> str:
-    if row["text"]:
-        return row["text"]
-    decoded = _decode_attributed_body(row["attributedBody"])
-    if decoded:
-        return decoded
+def _body(row: sqlite3.Row, atts: list[dict] | None = None) -> str:
+    text = row["text"] or _decode_attributed_body(row["attributedBody"]) or ""
+    tags = " ".join(_attachment_tag(a) for a in (atts or []))
+    if text and tags:
+        return f"{text} {tags}"
+    if tags:
+        return tags
+    if text:
+        return text
     if row["cache_has_attachments"]:
-        return "[attachment]"
+        return "[attachment: unavailable]"
     return ""
 
 
@@ -300,7 +396,8 @@ def read(query: str, limit: int, match: int, as_json: bool) -> None:
 
     rows = conn.execute(
         """
-        SELECT datetime(m.date/1000000000 + ?, 'unixepoch', 'localtime') AS ts,
+        SELECT m.ROWID AS mid,
+               datetime(m.date/1000000000 + ?, 'unixepoch', 'localtime') AS ts,
                m.is_from_me AS mine, h.id AS handle,
                m.text, m.attributedBody, m.cache_has_attachments
         FROM message m
@@ -314,10 +411,16 @@ def read(query: str, limit: int, match: int, as_json: bool) -> None:
     ).fetchall()
     rows = list(reversed(rows))
 
+    _sweep_stale_attachment_cache()
+    raw_atts = _fetch_attachments(conn, [r["mid"] for r in rows])
     out = []
     for r in rows:
         sender = "me" if r["mine"] else _resolve(r["handle"], contacts)
-        out.append({"ts": r["ts"], "sender": sender, "text": _body(r)})
+        atts = [a for a in (_resolve_attachment(e) for e in raw_atts.get(r["mid"], [])) if a]
+        entry = {"ts": r["ts"], "sender": sender, "text": _body(r, atts)}
+        if atts:
+            entry["attachments"] = atts
+        out.append(entry)
     if as_json:
         click.echo(json.dumps(out, ensure_ascii=False))
         return
@@ -339,7 +442,8 @@ def search(text: str, limit: int, as_json: bool) -> None:
     contacts = _contact_map()
     rows = conn.execute(
         """
-        SELECT datetime(m.date/1000000000 + ?, 'unixepoch', 'localtime') AS ts,
+        SELECT m.ROWID AS mid,
+               datetime(m.date/1000000000 + ?, 'unixepoch', 'localtime') AS ts,
                m.is_from_me AS mine, h.id AS handle, m.text, m.attributedBody,
                m.cache_has_attachments
         FROM message m
@@ -350,14 +454,19 @@ def search(text: str, limit: int, as_json: bool) -> None:
         """,
         (APPLE_EPOCH, f"%{text}%", limit),
     ).fetchall()
-    out = [
-        {
+    _sweep_stale_attachment_cache()
+    raw_atts = _fetch_attachments(conn, [r["mid"] for r in rows])
+    out = []
+    for r in rows:
+        atts = [a for a in (_resolve_attachment(e) for e in raw_atts.get(r["mid"], [])) if a]
+        entry = {
             "ts": r["ts"],
             "sender": "me" if r["mine"] else _resolve(r["handle"], contacts),
-            "text": _body(r),
+            "text": _body(r, atts),
         }
-        for r in rows
-    ]
+        if atts:
+            entry["attachments"] = atts
+        out.append(entry)
     if as_json:
         click.echo(json.dumps(out, ensure_ascii=False))
         return

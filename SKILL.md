@@ -108,5 +108,12 @@ imsg send jason "running late" --yes    # actually sends
 - **Body text decoding.** When a message's `text` column is empty (newer macOS),
   the body is decoded from the `attributedBody` blob; undecodable
   attachment-only messages show as `[attachment]`.
+- **Photos and files are resolved, not just flagged.** `read`/`search` copy
+  every attachment out into `$TMPDIR/imsg-attachments/`; images (incl. HEIC)
+  are normalized to JPEG via `sips`. The text shows a `[image: <path>]` /
+  `[file: <path>]` tag and `--json` adds an `attachments` array — open the
+  path with a Read tool to actually see the photo instead of assuming the
+  conversation's topic didn't change at that message. A source never
+  downloaded from iCloud is skipped, not guessed at.
 - **Timestamps** are converted from Apple absolute time to local time.
 - Every read command supports `--json` for structured output.

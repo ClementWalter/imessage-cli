@@ -108,6 +108,17 @@ outbound action: it **defaults to a dry-run** and only sends with `--yes`.
 - **Body-text decoding.** When a message's `text` column is empty (newer
   macOS), the body is decoded from the `attributedBody` blob; undecodable
   attachment-only messages show as `[attachment]`.
+- **Attachments are resolved, not just flagged.** `read`/`search` copy every
+  attachment out of the protected `~/Library/Messages/Attachments` store into
+  `$TMPDIR/imsg-attachments/`; images (including HEIC, the iPhone default) are
+  normalized to JPEG via `sips` so they're directly viewable. The message text
+  gets a `[image: <path>]` / `[file: <path>]` tag, and `--json` output adds an
+  `attachments: [{path, kind, name}]` array — an agent can then open the path
+  directly instead of treating a photo as an opaque `[attachment]` placeholder
+  (this is what a message actually says when the text alone is ambiguous or
+  empty). Cached files persist for 24h (swept lazily on the next run) since a
+  caller reads them *after* this process exits. A source file not on disk
+  (offloaded to iCloud, never downloaded) is skipped rather than guessed at.
 - **Timestamps** are converted from Apple absolute time to local time.
 
 ## Dependencies
