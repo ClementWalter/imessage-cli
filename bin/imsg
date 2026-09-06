@@ -69,6 +69,19 @@ _ATTACHMENT_STALE_SECONDS = 24 * 3600
 # directly viewable, not just for HEIC.
 _IMAGE_EXTS = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".gif", ".tiff", ".tif", ".bmp", ".webp"}
 
+# Tapbacks (reactions) are not a column on the message they decorate: each one
+# is its own `message` row whose `associated_message_guid` points at the target.
+# Type 2000+n adds reaction n, 3000+n removes that same reaction again.
+_REACTION_ADD_BASE = 2000
+_REACTION_REMOVE_BASE = 3000
+_REACTION_MAX = 3999
+_REACTION_KINDS = {0: "❤️", 1: "👍", 2: "👎", 3: "😂", 4: "‼️", 5: "❓"}
+# Kind 6 is a free-form emoji tapback; the emoji itself sits in its own column.
+_REACTION_EMOJI_KIND = 6
+# How much of a reacted-to message to quote when that message is outside the
+# window being printed.
+_TARGET_SNIPPET_CHARS = 60
+
 
 def _sweep_stale_snapshots() -> None:
     """Delete snapshot dirs left by earlier runs that exited before cleanup.
@@ -250,6 +263,96 @@ def _body(row: sqlite3.Row, atts: list[dict] | None = None) -> str:
     return ""
 
 
+def _target_guid(raw: str | None) -> str | None:
+    """Bare message guid a tapback points at.
+
+    Messages writes the target three ways — `p:<part>/<guid>` (a part of a
+    multi-part message), `bp:<guid>`, and the bare guid — all of which denote
+    the same `message.guid`.
+    """
+    if not raw:
+        return None
+    return raw.rsplit("/", 1)[-1].split(":")[-1] or None
+
+
+def _reaction_kind(row: sqlite3.Row) -> str | None:
+    """Emoji for a tapback row, or None if the type is not a known reaction."""
+    atype = row["associated_message_type"] or 0
+    if not _REACTION_ADD_BASE <= atype <= _REACTION_MAX:
+        return None
+    kind = atype % 1000
+    if kind == _REACTION_EMOJI_KIND:
+        return row["associated_message_emoji"] or "❔"
+    return _REACTION_KINDS.get(kind)
+
+
+def _fetch_reactions(
+    conn: sqlite3.Connection, contacts: dict[str, str], chat_id: int | None = None
+) -> dict[str, list[dict]]:
+    """Live tapbacks per target guid, in chronological order.
+
+    Adds and removals are replayed in date order so a tapback the sender later
+    took back leaves nothing behind — the DB keeps both rows forever.
+    """
+    scope = "JOIN chat_message_join cmj ON cmj.message_id = m.ROWID" if chat_id else ""
+    where = "AND cmj.chat_id = ?" if chat_id else ""
+    params: list = [APPLE_EPOCH, _REACTION_ADD_BASE, _REACTION_MAX]
+    if chat_id:
+        params.append(chat_id)
+    rows = conn.execute(
+        f"""
+        SELECT m.date AS date,
+               datetime(m.date/1000000000 + ?, 'unixepoch', 'localtime') AS ts,
+               m.is_from_me AS mine, h.id AS handle,
+               m.associated_message_guid, m.associated_message_type,
+               m.associated_message_emoji
+        FROM message m
+        {scope}
+        LEFT JOIN handle h ON h.ROWID = m.handle_id
+        WHERE m.associated_message_type BETWEEN ? AND ?
+        {where}
+        ORDER BY m.date
+        """,
+        params,
+    ).fetchall()
+
+    live: dict[tuple, dict] = {}
+    for r in rows:
+        target = _target_guid(r["associated_message_guid"])
+        kind = _reaction_kind(r)
+        if not target or not kind:
+            continue
+        sender = "me" if r["mine"] else _resolve(r["handle"], contacts)
+        key = (target, sender, kind)
+        if r["associated_message_type"] >= _REACTION_REMOVE_BASE:
+            live.pop(key, None)
+        else:
+            live[key] = {"ts": r["ts"], "date": r["date"], "sender": sender, "kind": kind}
+
+    out: dict[str, list[dict]] = {}
+    for (target, _, _), entry in sorted(live.items(), key=lambda kv: kv[1]["date"]):
+        out.setdefault(target, []).append(entry)
+    return out
+
+
+def _reaction_tag(reactions: list[dict]) -> str:
+    return "[" + ", ".join(f"{r['kind']} {r['sender']}" for r in reactions) + "]"
+
+
+def _target_snippet(conn: sqlite3.Connection, guid: str) -> str:
+    """Short quote of the message a tapback points at, for out-of-window targets."""
+    row = conn.execute(
+        "SELECT text, attributedBody, cache_has_attachments FROM message WHERE guid = ?",
+        (guid,),
+    ).fetchone()
+    if row is None:
+        return "(message unavailable)"
+    body = " ".join(_body(row).split())
+    if len(body) > _TARGET_SNIPPET_CHARS:
+        body = body[: _TARGET_SNIPPET_CHARS - 1] + "…"
+    return body or "(empty message)"
+
+
 def _digits(handle: str) -> str:
     """Last 10 digits of a phone handle, for tolerant cross-format matching."""
     return re.sub(r"\D", "", handle)[-10:]
@@ -394,9 +497,11 @@ def read(query: str, limit: int, match: int, as_json: bool) -> None:
         raise SystemExit(1)
     chat = candidates[match - 1 if match else 0]
 
+    # Tapback rows are excluded here and folded back into their target below,
+    # so --limit counts real messages rather than being eaten by reactions.
     rows = conn.execute(
         """
-        SELECT m.ROWID AS mid,
+        SELECT m.ROWID AS mid, m.guid AS guid, m.date AS date,
                datetime(m.date/1000000000 + ?, 'unixepoch', 'localtime') AS ts,
                m.is_from_me AS mine, h.id AS handle,
                m.text, m.attributedBody, m.cache_has_attachments
@@ -404,15 +509,17 @@ def read(query: str, limit: int, match: int, as_json: bool) -> None:
         JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
         LEFT JOIN handle h ON h.ROWID = m.handle_id
         WHERE cmj.chat_id = ?
+          AND m.associated_message_type NOT BETWEEN ? AND ?
         ORDER BY m.date DESC
         LIMIT ?
         """,
-        (APPLE_EPOCH, chat["id"], limit),
+        (APPLE_EPOCH, chat["id"], _REACTION_ADD_BASE, _REACTION_MAX, limit),
     ).fetchall()
     rows = list(reversed(rows))
 
     _sweep_stale_attachment_cache()
     raw_atts = _fetch_attachments(conn, [r["mid"] for r in rows])
+    reactions = _fetch_reactions(conn, contacts, chat["id"])
     out = []
     for r in rows:
         sender = "me" if r["mine"] else _resolve(r["handle"], contacts)
@@ -420,7 +527,33 @@ def read(query: str, limit: int, match: int, as_json: bool) -> None:
         entry = {"ts": r["ts"], "sender": sender, "text": _body(r, atts)}
         if atts:
             entry["attachments"] = atts
+        if reactions.get(r["guid"]):
+            entry["reactions"] = [
+                {"kind": x["kind"], "sender": x["sender"]} for x in reactions[r["guid"]]
+            ]
         out.append(entry)
+
+    # A tapback on a message older than the window has nothing to attach to, so
+    # it keeps its own line — quoting the target rather than dropping it.
+    shown = {r["guid"] for r in rows}
+    floor = rows[0]["date"] if rows else 0
+    for target, entries in reactions.items():
+        if target in shown:
+            continue
+        for x in entries:
+            if x["date"] < floor:
+                continue
+            snippet = _target_snippet(conn, target)
+            out.append(
+                {
+                    "ts": x["ts"],
+                    "sender": x["sender"],
+                    "text": f"{x['kind']} → “{snippet}”",
+                    "reaction": x["kind"],
+                    "reaction_target": snippet,
+                }
+            )
+    out.sort(key=lambda m: m["ts"])
     if as_json:
         click.echo(json.dumps(out, ensure_ascii=False))
         return
@@ -429,7 +562,8 @@ def read(query: str, limit: int, match: int, as_json: bool) -> None:
     ) or chat["ident"]
     click.echo(f"# {title} — {len(out)} messages\n")
     for m in out:
-        click.echo(f"{m['ts']}  {m['sender']}: {m['text']}")
+        tag = f"  {_reaction_tag(m['reactions'])}" if m.get("reactions") else ""
+        click.echo(f"{m['ts']}  {m['sender']}: {m['text']}{tag}")
 
 
 @cli.command()
@@ -442,7 +576,7 @@ def search(text: str, limit: int, as_json: bool) -> None:
     contacts = _contact_map()
     rows = conn.execute(
         """
-        SELECT m.ROWID AS mid,
+        SELECT m.ROWID AS mid, m.guid AS guid,
                datetime(m.date/1000000000 + ?, 'unixepoch', 'localtime') AS ts,
                m.is_from_me AS mine, h.id AS handle, m.text, m.attributedBody,
                m.cache_has_attachments
@@ -456,6 +590,7 @@ def search(text: str, limit: int, as_json: bool) -> None:
     ).fetchall()
     _sweep_stale_attachment_cache()
     raw_atts = _fetch_attachments(conn, [r["mid"] for r in rows])
+    reactions = _fetch_reactions(conn, contacts)
     out = []
     for r in rows:
         atts = [a for a in (_resolve_attachment(e) for e in raw_atts.get(r["mid"], [])) if a]
@@ -466,12 +601,17 @@ def search(text: str, limit: int, as_json: bool) -> None:
         }
         if atts:
             entry["attachments"] = atts
+        if reactions.get(r["guid"]):
+            entry["reactions"] = [
+                {"kind": x["kind"], "sender": x["sender"]} for x in reactions[r["guid"]]
+            ]
         out.append(entry)
     if as_json:
         click.echo(json.dumps(out, ensure_ascii=False))
         return
     for m in out:
-        click.echo(f"{m['ts']}  {m['sender']}: {m['text']}")
+        tag = f"  {_reaction_tag(m['reactions'])}" if m.get("reactions") else ""
+        click.echo(f"{m['ts']}  {m['sender']}: {m['text']}{tag}")
 
 
 def _applescript_quote(text: str) -> str:

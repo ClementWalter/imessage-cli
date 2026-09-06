@@ -115,5 +115,12 @@ imsg send jason "running late" --yes    # actually sends
   path with a Read tool to actually see the photo instead of assuming the
   conversation's topic didn't change at that message. A source never
   downloaded from iCloud is skipped, not guessed at.
+- **Tapbacks (reactions) are attached to their message.** They are separate rows
+  in `chat.db`, so `read`/`search` fold them back onto the message they point
+  at as a `[👍 alice, 😂 me]` tag (`reactions: [{kind, sender}]` in `--json`),
+  after replaying adds and removals so a tapback someone took back is gone.
+  They no longer count against `--limit`. A reaction whose target is older than
+  the window shown keeps its own line, quoting that target
+  (`😂 → "En bon père de famille"`).
 - **Timestamps** are converted from Apple absolute time to local time.
 - Every read command supports `--json` for structured output.

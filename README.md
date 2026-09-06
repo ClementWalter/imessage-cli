@@ -119,6 +119,15 @@ outbound action: it **defaults to a dry-run** and only sends with `--yes`.
   empty). Cached files persist for 24h (swept lazily on the next run) since a
   caller reads them *after* this process exits. A source file not on disk
   (offloaded to iCloud, never downloaded) is skipped rather than guessed at.
+- **Tapbacks are folded into the message they decorate.** A reaction is its own
+  row in `chat.db`, not a flag on the message it points at, so a naive read
+  spells it out as a separate localized pseudo-message (`A ajouté un « J'aime »
+  à « ... »`) that also eats a `--limit` slot. `read`/`search` instead replay
+  adds and removals in date order — a tapback later taken back leaves nothing
+  behind — and hang the survivors off their target as a `[👍 alice, 😂 me]` tag,
+  with a `reactions: [{kind, sender}]` array in `--json`. A reaction whose
+  target is older than the window keeps its own line, quoting the message it
+  answers (`😂 → "En bon père de famille"`).
 - **Timestamps** are converted from Apple absolute time to local time.
 
 ## Dependencies
@@ -129,6 +138,15 @@ Declared inline via PEP 723 in `imsg`:
 - `pyobjc-framework-Contacts` — macOS-only, resolves handles to contact names
 
 Everything else is Python stdlib (`sqlite3`, `shutil`, `subprocess`, …).
+
+## Tests
+
+```bash
+uv run --with pytest --with click pytest tests/
+```
+
+The suite drives the CLI against an in-memory chat.db fixture, so it needs
+neither Full Disk Access nor your real message history.
 
 ## Scope
 
