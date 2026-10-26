@@ -39,6 +39,12 @@ bundled launcher `bin/imsg` resolved against this skill's own directory (PEP 723
 ln -sfn <skill-dir>/bin/imsg ~/.local/bin/imsg
 ```
 
+**A person's name usually matches several chats** (their 1:1 thread plus every
+group they're in), and `read`/`send` then print a numbered list and exit 1
+instead of picking one. The list is most recent first, so for "the thread with
+X" pass `--match 1` from the start: `imsg read "Jane Doe" --match 1`. For
+`send`, read the list and pick the recipient deliberately.
+
 ## Prerequisite: Full Disk Access (one-time)
 
 `chat.db` is protected by macOS privacy (TCC). Grant the **terminal app that
@@ -72,12 +78,12 @@ resolve to a contact name when possible, else the handle.
 ### `imsg read <query> [--limit N] [--match N] [--json]`
 
 Show messages from the chat best matching `<query>` (fuzzy against contact name,
-handle, or group name). If several chats match, it prints a numbered list — pick
-one with `--match N`.
+handle, or group name). If several chats match, it prints a numbered list (most
+recent first) and exits 1 — pick one with `--match N`.
 
 ```bash
-imsg read jason            # most likely "Jason" thread
-imsg read jason --match 2  # 2nd match when ambiguous
+imsg read jason --match 1  # most recent chat matching "jason"
+imsg read jason --match 2  # 2nd most recent
 imsg read "+33612345678"   # by handle
 imsg read "Family" --limit 200
 ```
