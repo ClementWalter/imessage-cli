@@ -1,5 +1,7 @@
 # imessage-cli
 
+**Visibility: public.**
+
 Terminal access to your **own** iMessage / SMS history by reading the local
 Messages database (`~/Library/Messages/chat.db`) read-only:
 
@@ -45,8 +47,8 @@ runs the command** Full Disk Access, or every command fails with
 
 ## Install
 
-**A — Bundled launcher.** No install step. Clone the repo and invoke `imsg`
-directly; the `#!/usr/bin/env -S uv run --script` shebang and
+**A — Bundled launcher.** No install step. Clone the repo and invoke
+`bin/imsg` (a symlink to `imessage_cli.py`) directly; the `#!/usr/bin/env -S uv run --script` shebang and
 [PEP 723](https://peps.python.org/pep-0723/) inline metadata make `uv` pull
 deps on the first run.
 
@@ -57,7 +59,7 @@ cd imessage-cli
 ```
 
 **B — As an agent skill.** The repo ships a `SKILL.md` and the self-contained
-`imsg` launcher at the project root, in the
+`bin/imsg` launcher, in the
 [Vercel Labs `skills`](https://github.com/vercel-labs/skills) format:
 
 ```bash
@@ -67,7 +69,7 @@ npx skills add ClementWalter/imessage-cli
 This drops the skill under `~/.agents/skills/imessage-cli/` and symlinks it into
 every supported agent runtime installed on your machine (Claude Code, Cursor,
 Windsurf, Codex, Gemini CLI, …). Agents then drive the CLI by invoking the
-bundled `imsg` script directly.
+bundled `bin/imsg` script directly.
 
 To install locally for development instead, symlink the checkout so the skill
 picks up live edits:
@@ -132,7 +134,7 @@ outbound action: it **defaults to a dry-run** and only sends with `--yes`.
 
 ## Dependencies
 
-Declared inline via PEP 723 in `imsg`:
+Declared inline via PEP 723 in `imessage_cli.py`, pinned exactly:
 
 - `click` — CLI framework
 - `pyobjc-framework-Contacts` — macOS-only, resolves handles to contact names
@@ -142,7 +144,7 @@ Everything else is Python stdlib (`sqlite3`, `shutil`, `subprocess`, …).
 ## Tests
 
 ```bash
-uv run --with pytest --with click pytest tests/
+uv run --script tests/test_imsg.py
 ```
 
 The suite drives the CLI against an in-memory chat.db fixture, so it needs

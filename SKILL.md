@@ -23,29 +23,24 @@ SQLite store is the only way to read history.
 
 ## How to invoke
 
-Invoke it as **`imsg`** — on `$PATH` via a symlink in `~/.local/bin` onto this
-repo's `bin/imsg`, so it always runs the current checkout: a `git pull`, or even
-an uncommitted edit, takes effect immediately with nothing to reinstall.
+Invoke it as **`imsg`** — on `$PATH` via `claudine/scripts/link_clis.py`, which
+links this repo's `bin/imsg` into `~/.local/bin`, so it always runs the current
+checkout: a `git pull`, or even an uncommitted edit, takes effect immediately
+with nothing to reinstall.
 
 ```bash
 imsg chats
 ```
 
-Examples in this doc are written that way. If `imsg` is not on `$PATH`, run the
-bundled launcher `bin/imsg` resolved against this skill's own directory (PEP 723
-— `uv` resolves deps inline on first run), or link it once:
+If `imsg` is not on `$PATH`, run `<skill-dir>/bin/imsg` (a symlink to
+`imessage_cli.py`, a PEP 723 script — `uv` resolves deps inline on first run).
 
-```bash
-ln -sfn <skill-dir>/bin/imsg ~/.local/bin/imsg
-```
+## Authentication
 
-**A person's name usually matches several chats** (their 1:1 thread plus every
-group they're in), and `read`/`send` then print a numbered list and exit 1
-instead of picking one. The list is most recent first, so for "the thread with
-X" pass `--match 1` from the start: `imsg read "Jane Doe" --match 1`. For
-`send`, read the list and pick the recipient deliberately.
+No login: the CLI reads the local Messages database. It needs macOS privacy
+permissions instead.
 
-## Prerequisite: Full Disk Access (one-time)
+### Full Disk Access (one-time)
 
 `chat.db` is protected by macOS privacy (TCC). Grant the **terminal app that
 runs the command** Full Disk Access:
@@ -58,17 +53,27 @@ Until then every command fails with `authorization denied`. Contact-name
 resolution additionally uses Contacts access; without it, raw phone/email
 handles are shown instead (commands still work).
 
-## When to use
+## Output conventions
 
-Trigger when the user wants to **read, search, or send their personal
-iMessages/SMS** — "show my texts with X", "what did Y message me", "search my
-messages for Z", "text X that …".
-
-Do **not** use it to read or send on someone else's account. Sending is an
-outbound action: confirm the exact recipient and text with the user before
-running `send --yes`.
+- Default: compact text, one line per message (`ts  sender: text`) or per chat.
+- `--json` on every read command: structured rows, with `attachments` and
+  `reactions: [{kind, sender}]` arrays.
+- stdout carries data only; errors go to stderr with a non-zero exit.
+- **Timestamps** are converted from Apple absolute time to local time.
+- Attachment-only messages whose body can't be decoded show as `[attachment]`;
+  resolved photos/files show as `[image: <path>]` / `[file: <path>]`.
+- Tapbacks are folded onto their message as a `[👍 alice, 😂 me]` tag.
 
 ## Commands
+
+```bash
+# Read
+imsg chats [--limit N] [--json]                        # conversations, most recent first
+imsg read <query> [--limit N] [--match N] [--json]     # one thread (contact name, handle or group name)
+imsg search <text> [--limit N] [--json]                # substring search across all messages
+# Write (dry-run unless --yes)
+imsg send <query> <text> [--match N] [--handle H] [--sms] [--yes]
+```
 
 ### `imsg chats [--limit N] [--json]`
 
@@ -105,6 +110,49 @@ imsg send jason "running late"          # dry-run: shows recipient + text
 imsg send jason "running late" --yes    # actually sends
 ```
 
+## Recipes
+
+```bash
+# The 1:1 thread with someone (most recent matching chat)
+imsg read "Jane Doe" --match 1 --limit 100
+
+# What did a group say recently, as JSON for filtering
+imsg read Family --limit 200 --json
+
+# Find the message that mentioned an address or a code
+imsg search "digicode" --limit 20
+
+# Text someone: dry-run, check the recipient, then send
+imsg send "Jane Doe" "running late" --match 1
+imsg send "Jane Doe" "running late" --match 1 --yes
+```
+
+## Gotchas
+
+- **A person's name usually matches several chats** (their 1:1 thread plus every
+  group they're in), and `read`/`send` then print a numbered list and exit 1
+  instead of picking one. The list is most recent first, so for "the thread with
+  X" pass `--match 1` from the start: `imsg read "Jane Doe" --match 1`. For
+  `send`, read the list and pick the recipient deliberately.
+- Every command fails with `authorization denied` until the terminal app has
+  Full Disk Access **and was relaunched**.
+- Without Contacts access, raw phone/email handles are shown instead of names
+  (commands still work).
+- A photo never downloaded from iCloud is skipped, not guessed at; open the
+  `[image: <path>]` file with a Read tool rather than assuming its content.
+- Sending is outbound: confirm the exact recipient and text with the user before
+  `send --yes`.
+
+## When to use
+
+Trigger when the user wants to **read, search, or send their personal
+iMessages/SMS** — "show my texts with X", "what did Y message me", "search my
+messages for Z", "text X that …".
+
+Do **not** use it to read or send on someone else's account. Sending is an
+outbound action: confirm the exact recipient and text with the user before
+running `send --yes`.
+
 ## Notes
 
 - **Reading is read-only by construction.** The CLI snapshots `chat.db` (+ its
@@ -128,5 +176,20 @@ imsg send jason "running late" --yes    # actually sends
   They no longer count against `--limit`. A reaction whose target is older than
   the window shown keeps its own line, quoting that target
   (`😂 → "En bon père de famille"`).
-- **Timestamps** are converted from Apple absolute time to local time.
-- Every read command supports `--json` for structured output.
+
+## Tests
+
+```bash
+uv run --script tests/test_imsg.py
+```
+
+## Project layout
+
+```
+imessage-cli/
+  SKILL.md            # this file
+  README.md
+  imessage_cli.py     # the CLI (PEP 723 script)
+  bin/imsg            # symlink -> ../imessage_cli.py — invoke this
+  tests/test_imsg.py  # offline tests against an in-memory chat.db
+```
