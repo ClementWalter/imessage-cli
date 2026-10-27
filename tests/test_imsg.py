@@ -1,10 +1,22 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "click==8.3.3",
+#     "pyobjc-framework-Contacts==12.1; sys_platform == 'darwin'",
+#     "pytest==9.1.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
 """Tests for tapback (reaction) folding in the `imsg` CLI.
 
-The CLI is a PEP 723 single-file script without a `.py` extension, so it is
-loaded by path rather than imported. Fixtures build a miniature chat.db in
-memory: only the columns the CLI actually queries are declared.
+The CLI is a PEP 723 single-file script, loaded by path rather than imported.
+Fixtures build a miniature chat.db in memory: only the columns the CLI actually
+queries are declared.
 
-Run with: uv run --with pytest --with click pytest tests/
+Run with: uv run --script tests/test_imsg.py
 """
 
 from __future__ import annotations
@@ -19,7 +31,7 @@ from click.testing import CliRunner
 _SPEC = importlib.util.spec_from_loader(
     "imsg",
     importlib.machinery.SourceFileLoader(
-        "imsg", str(Path(__file__).resolve().parent.parent / "bin" / "imsg")
+        "imsg", str(Path(__file__).resolve().parent.parent / "imessage_cli.py")
     ),
 )
 imsg = importlib.util.module_from_spec(_SPEC)
@@ -163,3 +175,7 @@ def test_read_json_carries_reactions(run):
 
 def test_search_attaches_reactions_to_hits(run):
     assert "hello  [👍 +33600000000]" in run("search", "hello")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))
