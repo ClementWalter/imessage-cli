@@ -122,7 +122,8 @@ Set up (or remove) the iMessage Reader helper described under Full Disk Access.
 Dry run without `--yes`. After `helper-install --yes`, tell the user to switch
 on "iMessage Reader" in the Full Disk Access window that opened, then poll
 `helper-status` until `ready` is true. Reinstalling the same build keeps the
-grant; a rebuilt helper may need switching on again (ad hoc signature).
+grant; with a released (Developer ID) build, updates keep it too, while a
+local ad hoc build may need switching on again after a rebuild.
 
 ### `imsg send <query> <text> [--match N] [--handle H] [--sms] [--yes]`
 

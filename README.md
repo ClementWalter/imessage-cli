@@ -178,12 +178,22 @@ show as unavailable. The copy holds your whole message history in clear, as
 readable as the original to any process running as you without sandboxing,
 which is the same exposure as `chat.db` minus the Full Disk Access gate.
 
-Ad hoc signing ties the Full Disk Access grant to the binary's hash: a rebuilt
-helper may show up as a new app and need switching on again. With a Developer
-ID certificate, `build.py` signs with `--sign "Developer ID Application: ..."
---options runtime --timestamp`, the app is notarized (`xcrun notarytool submit
---wait`) and stapled (`xcrun stapler staple`); the grant then follows the team
-ID and bundle ID across rebuilds, and Gatekeeper accepts the app on any Mac.
+`helper/build.py` signs ad hoc by default, which ties the Full Disk Access
+grant to the binary's hash: a rebuilt helper may show up as a new app and need
+switching on again. Released builds are signed with a Developer ID and
+notarized:
+
+```bash
+CODESIGN_IDENTITY="Developer ID Application: <name> (<team id>)" \
+NOTARY_KEYCHAIN_PROFILE=<notarytool profile> \
+  uv run --script helper/build.py
+```
+
+That signs with the hardened runtime and a secure timestamp, submits to Apple's
+notary service, staples the ticket and checks it with `spctl`. The grant then
+follows the team ID and bundle ID across rebuilds, and Gatekeeper accepts the
+app on any Mac. `mcp-bridge pack` runs this build, so export both variables
+before packing a release.
 
 ## Dependencies
 
