@@ -42,12 +42,13 @@ permissions instead.
 
 ### Full Disk Access (one-time)
 
-`chat.db` is protected by macOS privacy (TCC). Grant the **terminal app that
-runs the command** Full Disk Access:
+`chat.db` is protected by macOS privacy (TCC). Grant the **app that runs the
+command** Full Disk Access: your terminal, or **Claude** when these tools are
+served to Claude Desktop or Cowork (the iMessage extension):
 
 1. System Settings → Privacy & Security → **Full Disk Access**
-2. Enable (or add with **+**) your terminal — e.g. **iTerm** or **Terminal**
-3. **Quit and relaunch** that terminal app (required for it to take effect)
+2. Enable (or add with **+**) that app — e.g. **iTerm**, **Terminal** or **Claude**
+3. **Quit and relaunch** that app (required for it to take effect)
 
 Until then every command fails with `authorization denied`. Contact-name
 resolution additionally uses Contacts access; without it, raw phone/email

@@ -19,9 +19,9 @@ thread, search across messages.
 
 Two macOS specifics drive the design:
 
-* **Full Disk Access.** `chat.db` is TCC-protected. The terminal app running
-  this command (e.g. iTerm) must be granted Full Disk Access, otherwise every
-  query fails with "authorization denied".
+* **Full Disk Access.** `chat.db` is TCC-protected. The app running this
+  command (the terminal, or Claude when served over MCP) must be granted Full
+  Disk Access, otherwise every query fails with "authorization denied".
 * **WAL + text encoding.** The DB uses write-ahead logging while Messages is
   live, and recent macOS stores body text in the `attributedBody` blob rather
   than the `text` column. We snapshot the DB files to a temp dir before reading,
@@ -115,9 +115,12 @@ def _snapshot_db() -> Path:
         raise click.ClickException(f"{CHAT_DB} not found — is this macOS Messages?")
     if not _readable(CHAT_DB):
         raise click.ClickException(
-            "chat.db is not readable: grant the terminal app (iTerm/Terminal) "
-            "Full Disk Access in System Settings → Privacy & Security, then "
-            "restart it."
+            "chat.db is not readable: macOS needs Full Disk Access for the app "
+            "running this command (Claude when called from Claude Desktop, else "
+            "the terminal). Open System Settings → Privacy & Security → Full Disk "
+            "Access (or run `open 'x-apple.systempreferences:com.apple.preference."
+            "security?Privacy_AllFiles'`), switch that app on, then quit and "
+            "reopen it."
         )
     _sweep_stale_snapshots()
     tmp = Path(tempfile.mkdtemp(prefix=_SNAPSHOT_PREFIX))
