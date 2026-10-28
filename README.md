@@ -228,3 +228,9 @@ Same idea — your own messages, from the terminal, for other platforms:
   WhatsApp chats (pairs as a linked device)
 - [slack-user-cli](https://github.com/ClementWalter/slack-user-cli) — Slack via
   your existing browser session credentials
+
+## Privacy Policy
+
+The Claude Desktop extension built from this repository keeps your data on your
+Mac and talks only to the service it connects to. Full policy:
+<https://clementwalter.github.io/claude-extensions/privacy/>
