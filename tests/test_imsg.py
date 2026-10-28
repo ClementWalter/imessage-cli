@@ -10,11 +10,13 @@
 # [tool.uv]
 # exclude-newer = "2026-10-27T00:00:00Z"
 # ///
-"""Tests for tapback (reaction) folding in the `imsg` CLI.
+"""Tests for the `imsg` CLI: tapback folding and the iMessage Reader helper.
 
 The CLI is a PEP 723 single-file script, loaded by path rather than imported.
 Fixtures build a miniature chat.db in memory: only the columns the CLI actually
-queries are declared.
+queries are declared. Helper tests point every helper path at a temp dir and
+stub `subprocess.run`, so nothing touches launchd, System Settings or the real
+Messages database.
 
 Run with: uv run --script tests/test_imsg.py
 """
@@ -22,7 +24,11 @@ Run with: uv run --script tests/test_imsg.py
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import plistlib
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -166,8 +172,6 @@ def test_read_reports_unavailable_target(db, run):
 
 
 def test_read_json_carries_reactions(run):
-    import json
-
     assert json.loads(run("read", "+336", "--json"))[0]["reactions"] == [
         {"kind": "👍", "sender": "+33600000000"}
     ]
@@ -175,6 +179,252 @@ def test_read_json_carries_reactions(run):
 
 def test_search_attaches_reactions_to_hits(run):
     assert "hello  [👍 +33600000000]" in run("search", "hello")
+
+
+
+# --- iMessage Reader helper -------------------------------------------------
+
+
+@pytest.fixture
+def paths(tmp_path, monkeypatch):
+    """Every path the CLI uses for chat.db and the helper, under tmp_path."""
+    p = {
+        "chat_db": tmp_path / "Messages" / "chat.db",
+        "helper_dir": tmp_path / "support",
+        "built_app": tmp_path / "dist" / "iMessage Reader.app",
+        "installed_app": tmp_path / "Applications" / "iMessage Reader.app",
+        "agent": tmp_path / "LaunchAgents" / "agent.plist",
+    }
+    monkeypatch.setattr(imsg, "CHAT_DB", p["chat_db"])
+    monkeypatch.setattr(imsg, "HELPER_DIR", p["helper_dir"])
+    monkeypatch.setattr(imsg, "HELPER_COPY", p["helper_dir"] / "chat.db")
+    monkeypatch.setattr(imsg, "HELPER_STATUS", p["helper_dir"] / "status.json")
+    monkeypatch.setattr(imsg, "HELPER_LOG", p["helper_dir"] / "helper.log")
+    monkeypatch.setattr(imsg, "HELPER_BUILT_APP", p["built_app"])
+    monkeypatch.setattr(imsg, "HELPER_INSTALLED_APP", p["installed_app"])
+    monkeypatch.setattr(imsg, "LAUNCH_AGENT", p["agent"])
+    return p
+
+
+def _write(path: Path, content: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    return path
+
+
+@pytest.fixture
+def no_direct_access(paths, monkeypatch):
+    """chat.db exists but is unreadable, as for a process without Full Disk Access."""
+    _write(paths["chat_db"], "live")
+    real_readable = imsg._readable
+    monkeypatch.setattr(imsg, "_readable", lambda p: p != paths["chat_db"] and real_readable(p))
+
+
+@pytest.fixture
+def helper_copy(paths):
+    return _write(paths["helper_dir"] / "chat.db", "copy")
+
+
+def _report(paths, *, ok=True, age=0.0, error=None):
+    status = {"ok": ok, "checked_at": time.time() - age, "error": error}
+    _write(paths["helper_dir"] / "status.json", json.dumps(status))
+
+
+@pytest.fixture
+def calls(monkeypatch):
+    """Records every subprocess.run command; each one succeeds."""
+    recorded: list[list[str]] = []
+
+    class Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **_):
+        recorded.append([str(c) for c in cmd])
+        return Done()
+
+    monkeypatch.setattr(imsg.subprocess, "run", fake_run)
+    return recorded
+
+
+@pytest.fixture
+def built_app(paths):
+    """A stand-in for the built bundle: only the files install copies."""
+    app = paths["built_app"]
+    _write(app / "Contents" / "Info.plist", "plist")
+    _write(app / "Contents" / "MacOS" / imsg.HELPER_EXECUTABLE, "binary")
+    return app
+
+
+def test_db_source_prefers_readable_chat_db(paths, helper_copy):
+    _write(paths["chat_db"], "live")
+    assert imsg._db_source() == paths["chat_db"]
+
+
+def test_db_source_falls_back_to_helper_copy(no_direct_access, helper_copy):
+    assert imsg._db_source() == helper_copy
+
+
+def test_snapshot_of_helper_copy_is_named_chat_db(no_direct_access, helper_copy):
+    assert imsg._snapshot_db().read_text() == "copy"
+
+
+def test_db_source_without_any_copy_points_at_helper_install(no_direct_access):
+    with pytest.raises(imsg.click.ClickException, match="helper-install"):
+        imsg._db_source()
+
+
+def test_db_source_warns_when_helper_stopped_reporting(paths, no_direct_access, helper_copy, caplog):
+    _report(paths, age=imsg.HELPER_STALE_SECONDS + 60)
+    imsg._db_source()
+    assert "helper-status" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("Label", "com.github.clementwalter.imessage-reader"),
+        ("AssociatedBundleIdentifiers", ["com.github.clementwalter.imessage-reader"]),
+        ("RunAtLoad", True),
+        ("KeepAlive", True),
+        ("ProcessType", "Background"),
+    ],
+)
+def test_launch_agent_plist_entry(paths, key, expected):
+    assert imsg._launch_agent_plist()[key] == expected
+
+
+def test_launch_agent_runs_installed_executable(paths):
+    assert imsg._launch_agent_plist()["ProgramArguments"] == [
+        str(paths["installed_app"] / "Contents" / "MacOS" / "imessage-reader")
+    ]
+
+
+def test_launch_agent_plist_serializes(paths):
+    assert plistlib.loads(plistlib.dumps(imsg._launch_agent_plist()))["Label"] == imsg.HELPER_BUNDLE_ID
+
+
+def test_status_ready_when_helper_reports(paths, no_direct_access, helper_copy, calls):
+    _report(paths)
+    assert imsg._helper_status()["ready"] is True
+
+
+def test_status_ready_with_old_copy_of_idle_database(paths, no_direct_access, helper_copy, calls):
+    old = time.time() - 3600
+    os.utime(helper_copy, (old, old))
+    _report(paths)
+    assert imsg._helper_status()["ready"] is True
+
+
+def test_status_not_ready_when_helper_stopped_reporting(paths, no_direct_access, helper_copy, calls):
+    _report(paths, age=imsg.HELPER_STALE_SECONDS + 60)
+    assert imsg._helper_status()["ready"] is False
+
+
+def test_status_not_ready_when_helper_denied(paths, no_direct_access, helper_copy, calls):
+    _report(paths, ok=False, error="no Full Disk Access")
+    assert imsg._helper_status()["ready"] is False
+
+
+def test_status_reports_helper_error(no_direct_access, paths, calls):
+    _report(paths, ok=False, error="no Full Disk Access")
+    assert imsg._helper_status()["helper_error"] == "no Full Disk Access"
+
+
+def test_status_tolerates_corrupt_status_file(no_direct_access, paths, calls):
+    _write(paths["helper_dir"] / "status.json", "{")
+    assert imsg._helper_status()["helper_ok"] is None
+
+
+def _status(**overrides):
+    return {"direct_access": False, "app_installed": True, "agent_loaded": True,
+            "helper_ok": False, "ready": False, **overrides}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"app_installed": False}, "helper-install"),
+        ({"agent_loaded": False}, "helper-install"),
+        ({"helper_ok": False}, "Full Disk Access"),
+        ({"helper_ok": None}, "not reported"),
+        ({"helper_ok": True, "ready": False}, "stopped reporting"),
+    ],
+    ids=["no-app", "no-agent", "denied", "starting", "stale"],
+)
+def test_next_step_names_the_fix(overrides, expected):
+    assert expected in imsg._next_step(_status(**overrides))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"direct_access": True, "app_installed": False}, {"helper_ok": True, "ready": True}],
+    ids=["direct", "ready"],
+)
+def test_next_step_is_empty_when_readable(overrides):
+    assert imsg._next_step(_status(**overrides)) == ""
+
+
+def test_helper_status_json_carries_next_step(no_direct_access, calls):
+    result = CliRunner().invoke(imsg.cli, ["helper-status", "--json"])
+    assert "next_step" in json.loads(result.output)
+
+
+def test_helper_install_dry_run_installs_nothing(paths, built_app, calls):
+    CliRunner().invoke(imsg.cli, ["helper-install"])
+    assert not paths["installed_app"].exists()
+
+
+def test_helper_install_dry_run_runs_no_command(paths, built_app, calls):
+    CliRunner().invoke(imsg.cli, ["helper-install"])
+    assert calls == []
+
+
+@pytest.fixture
+def installed(paths, built_app, calls):
+    result = CliRunner().invoke(imsg.cli, ["helper-install", "--yes"])
+    assert result.exit_code == 0, result.output
+    return calls
+
+
+def test_helper_install_copies_app(paths, installed):
+    assert (paths["installed_app"] / "Contents" / "MacOS" / "imessage-reader").read_text() == "binary"
+
+
+def test_helper_install_makes_executable_runnable(paths, installed):
+    assert os.access(paths["installed_app"] / "Contents" / "MacOS" / "imessage-reader", os.X_OK)
+
+
+def test_helper_install_writes_launch_agent(paths, installed):
+    assert plistlib.loads(paths["agent"].read_bytes()) == imsg._launch_agent_plist()
+
+
+def test_helper_install_keeps_copy_folder_private(paths, installed):
+    assert paths["helper_dir"].stat().st_mode & 0o777 == 0o700
+
+
+def test_helper_install_bootstraps_agent(paths, installed):
+    assert ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(paths["agent"])] in installed
+
+
+def test_helper_install_opens_full_disk_access_pane(installed):
+    assert ["open", imsg.FDA_PANE_URL] in installed
+
+
+def test_helper_install_reveals_app_in_finder(paths, installed):
+    assert ["open", "-R", str(paths["installed_app"])] in installed
+
+
+def test_helper_install_without_app_or_compiler_fails(paths, calls, monkeypatch):
+    monkeypatch.setattr(imsg.shutil, "which", lambda _: None)
+    result = CliRunner().invoke(imsg.cli, ["helper-install", "--yes"])
+    assert "xcode-select --install" in result.output
+
+
+def test_helper_uninstall_removes_app(paths, installed):
+    CliRunner().invoke(imsg.cli, ["helper-uninstall", "--yes"])
+    assert not paths["installed_app"].exists()
 
 
 if __name__ == "__main__":

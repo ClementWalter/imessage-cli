@@ -1,6 +1,8 @@
 {
   "display_name": "iMessage",
   "description": "Read, search and send your iMessages and SMS from Claude.",
-  "long_description": "Reads the Messages history on this Mac and sends messages through the Messages app.\n\nSetup: macOS protects the Messages database. Open System Settings → Privacy & Security → Full Disk Access, switch on Claude, then quit and reopen Claude. Sending asks once for permission to control Messages.",
-  "platforms": ["darwin"]
+  "long_description": "Reads the Messages history on this Mac and sends messages through the Messages app.\n\nSetup: macOS protects the Messages database behind Full Disk Access. Claude does not need it: a small helper app, iMessage Reader, holds that access alone and keeps a private copy of your messages for this extension. Ask Claude to run the iMessage helper-install tool (or run `imsg helper-install --yes`): it installs the helper and opens System Settings → Privacy & Security → Full Disk Access. Switch on \"iMessage Reader\" there (drag it in from the Finder window if it is not listed). No restart needed. Sending asks once for permission to control Messages.",
+  "platforms": [
+    "darwin"
+  ]
 }

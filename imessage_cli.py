@@ -19,9 +19,11 @@ thread, search across messages.
 
 Two macOS specifics drive the design:
 
-* **Full Disk Access.** `chat.db` is TCC-protected. The app running this
-  command (the terminal, or Claude when served over MCP) must be granted Full
-  Disk Access, otherwise every query fails with "authorization denied".
+* **Full Disk Access.** `chat.db` is TCC-protected. A terminal with Full Disk
+  Access reads it directly. Anything else (Claude Desktop, which would extend
+  the grant to every extension it runs) reads the copy kept by the iMessage
+  Reader helper app (`helper/`), which alone holds Full Disk Access:
+  `imsg helper-install` sets it up, `imsg helper-status` checks it.
 * **WAL + text encoding.** The DB uses write-ahead logging while Messages is
   live, and recent macOS stores body text in the `attributedBody` blob rather
   than the `text` column. We snapshot the DB files to a temp dir before reading,
@@ -37,6 +39,8 @@ import atexit
 import hashlib
 import json
 import logging
+import os
+import plistlib
 import re
 import shutil
 import sqlite3
@@ -56,6 +60,24 @@ log = logging.getLogger("imsg")
 CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
 # Apple absolute time (seconds since 2001-01-01) → Unix epoch offset.
 APPLE_EPOCH = 978307200
+# The iMessage Reader helper (helper/ImessageReader.swift) keeps a consistent
+# copy of chat.db here; these names must match the Swift source and Info.plist.
+HELPER_DIR = Path.home() / "Library" / "Application Support" / "imessage-cli"
+HELPER_COPY = HELPER_DIR / "chat.db"
+HELPER_STATUS = HELPER_DIR / "status.json"
+HELPER_LOG = HELPER_DIR / "helper.log"
+HELPER_BUNDLE_ID = "com.github.clementwalter.imessage-reader"
+HELPER_APP_NAME = "iMessage Reader.app"
+HELPER_EXECUTABLE = "imessage-reader"
+HELPER_SOURCE_DIR = Path(__file__).resolve().parent / "helper"
+# Prebuilt app shipped next to the source (the extension bundle).
+HELPER_BUILT_APP = HELPER_SOURCE_DIR / "dist" / HELPER_APP_NAME
+HELPER_INSTALLED_APP = Path.home() / "Applications" / HELPER_APP_NAME
+LAUNCH_AGENT = Path.home() / "Library" / "LaunchAgents" / f"{HELPER_BUNDLE_ID}.plist"
+FDA_PANE_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+# The helper checks chat.db every 5 s and recopies it (at most every 30 s) when
+# it changed, so a report older than this means it is stopped or stuck.
+HELPER_STALE_SECONDS = 120
 # Snapshot temp dirs share this prefix so they can be recognised and swept.
 _SNAPSHOT_PREFIX = "imsg-"
 # A snapshot older than this is certainly abandoned (a run finishes in
@@ -104,33 +126,68 @@ def _sweep_stale_snapshots() -> None:
             log.debug("could not sweep %s: %s", entry, exc)
 
 
+def _helper_report() -> dict:
+    """The helper's last status.json, or {} when it has never written one."""
+    try:
+        return json.loads(HELPER_STATUS.read_text())
+    except (OSError, ValueError) as exc:
+        log.debug("no helper status at %s: %s", HELPER_STATUS, exc)
+        return {}
+
+
+def _helper_current(report: dict) -> bool:
+    """Whether the helper recently confirmed its copy matches chat.db.
+
+    The copy's own mtime says nothing when Messages is idle (an unchanged
+    database is not recopied), so freshness comes from the helper's last check.
+    """
+    checked = report.get("checked_at") or 0
+    return bool(report.get("ok")) and time.time() - checked <= HELPER_STALE_SECONDS
+
+
+def _db_source() -> Path:
+    """The database to read: chat.db itself when readable, else the helper's copy.
+
+    Direct access wins so a terminal with Full Disk Access always sees the live
+    database; the helper's copy serves every process without that grant.
+    """
+    if _readable(CHAT_DB):
+        return CHAT_DB
+    if _readable(HELPER_COPY):
+        if not _helper_current(_helper_report()):
+            log.warning(
+                "reading the iMessage Reader copy, which may be out of date: "
+                "the helper is not reporting, run `imsg helper-status`"
+            )
+        return HELPER_COPY
+    if not CHAT_DB.exists():
+        raise click.ClickException(f"{CHAT_DB} not found — is this macOS Messages?")
+    raise click.ClickException(
+        "chat.db is not readable and the iMessage Reader helper has no copy yet. "
+        "Run `imsg helper-install --yes`, then in System Settings → Privacy & "
+        "Security → Full Disk Access switch on \"iMessage Reader\" (drag it in "
+        "from ~/Applications if it is not listed). `imsg helper-status` shows "
+        "progress. A terminal that has Full Disk Access reads chat.db directly."
+    )
+
+
 def _snapshot_db() -> Path:
-    """Copy chat.db (+ WAL/SHM sidecars) to a temp dir and return the copy.
+    """Copy the database (+ WAL/SHM sidecars) to a temp dir and return the copy.
 
     Reading the live DB risks lock contention with Messages and a half-applied
     WAL; a private copy sidesteps both and lets SQLite checkpoint freely. The
     copy is registered for deletion at process exit so it does not accumulate.
     """
-    if not CHAT_DB.exists():
-        raise click.ClickException(f"{CHAT_DB} not found — is this macOS Messages?")
-    if not _readable(CHAT_DB):
-        raise click.ClickException(
-            "chat.db is not readable: macOS needs Full Disk Access for the app "
-            "running this command (Claude when called from Claude Desktop, else "
-            "the terminal). Open System Settings → Privacy & Security → Full Disk "
-            "Access (or run `open 'x-apple.systempreferences:com.apple.preference."
-            "security?Privacy_AllFiles'`), switch that app on, then quit and "
-            "reopen it."
-        )
+    source = _db_source()
     _sweep_stale_snapshots()
     tmp = Path(tempfile.mkdtemp(prefix=_SNAPSHOT_PREFIX))
     # Remove this run's copy on exit — covers normal exit, ClickException, and
     # SystemExit alike, so a ~195 MB chat.db copy is never left behind.
     atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     for suffix in ["", "-wal", "-shm"]:
-        src = CHAT_DB.with_name(CHAT_DB.name + suffix)
+        src = source.with_name(source.name + suffix)
         if src.exists():
-            shutil.copy2(src, tmp / src.name)
+            shutil.copy2(src, tmp / CHAT_DB.with_name(CHAT_DB.name + suffix).name)
     return tmp / CHAT_DB.name
 
 
@@ -700,6 +757,197 @@ def send(
     if result.returncode != 0:
         raise click.ClickException(result.stderr.strip() or "osascript send failed")
     click.echo(f"Sent to {label} <{handle}> via {service}.")
+
+
+def _launch_agent_plist() -> dict:
+    """LaunchAgent that keeps the helper running in the user's session."""
+    return {
+        "Label": HELPER_BUNDLE_ID,
+        "ProgramArguments": [str(HELPER_INSTALLED_APP / "Contents" / "MacOS" / HELPER_EXECUTABLE)],
+        # Shows the helper under its app name in Login Items, not as a bare binary.
+        "AssociatedBundleIdentifiers": [HELPER_BUNDLE_ID],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        "StandardOutPath": str(HELPER_LOG),
+        "StandardErrorPath": str(HELPER_LOG),
+    }
+
+
+def _launchd_target() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def _agent_loaded() -> bool:
+    result = subprocess.run(
+        ["launchctl", "print", f"{_launchd_target()}/{HELPER_BUNDLE_ID}"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def _helper_status() -> dict:
+    """Installed app, LaunchAgent, the copy's age, and the helper's last report."""
+    reported = _helper_report()
+    copy_age = time.time() - HELPER_COPY.stat().st_mtime if HELPER_COPY.is_file() else None
+    status = {
+        "direct_access": _readable(CHAT_DB),
+        "app_installed": HELPER_INSTALLED_APP.is_dir(),
+        "agent_installed": LAUNCH_AGENT.is_file(),
+        "agent_loaded": _agent_loaded(),
+        "copy": str(HELPER_COPY),
+        "copy_age_seconds": None if copy_age is None else round(copy_age),
+        "helper_ok": reported.get("ok"),
+        "helper_error": reported.get("error"),
+        "helper_checked_seconds_ago": (
+            round(time.time() - reported["checked_at"]) if reported.get("checked_at") else None
+        ),
+    }
+    status["ready"] = status["direct_access"] or (
+        copy_age is not None and _helper_current(reported)
+    )
+    return status
+
+
+def _next_step(status: dict) -> str:
+    """The one action that moves the setup forward, or an empty string.
+
+    With direct access and no helper there is nothing to do; once the helper is
+    installed its own setup is still reported.
+    """
+    if status["direct_access"] and not status["app_installed"]:
+        return ""
+    if not status["app_installed"] or not status["agent_loaded"]:
+        return "Run `imsg helper-install --yes`."
+    if status["helper_ok"] is False:
+        return (
+            "In System Settings → Privacy & Security → Full Disk Access, switch on "
+            f"\"iMessage Reader\" (drag {HELPER_INSTALLED_APP} into the list if it is "
+            "missing). The helper retries every few seconds; no restart needed."
+        )
+    if status["helper_ok"] is None:
+        return "The helper has not reported yet: check again in a few seconds."
+    if not status["ready"]:
+        return f"The helper stopped reporting: check {HELPER_LOG}."
+    return ""
+
+
+def _bundled_app() -> Path:
+    """The prebuilt helper app, built from source when absent and swiftc exists."""
+    if HELPER_BUILT_APP.is_dir():
+        return HELPER_BUILT_APP
+    if shutil.which("swiftc") is None:
+        raise click.ClickException(
+            f"No prebuilt {HELPER_APP_NAME} at {HELPER_BUILT_APP} and no Swift "
+            "compiler to build it: install the Xcode command line tools "
+            "(`xcode-select --install`) or use an extension that bundles the app."
+        )
+    subprocess.run(
+        [sys.executable, str(HELPER_SOURCE_DIR / "build.py")],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    return HELPER_BUILT_APP
+
+
+@cli.command("helper-install", epilog="\b\nExamples:\n  imsg helper-install\n  imsg helper-install --yes")
+@click.option("--yes", is_flag=True, help="Install. Without it, only list the steps.")
+def helper_install(yes: bool) -> None:
+    """Install the iMessage Reader helper, the only app needing Full Disk Access.
+
+    Copies the helper app to ~/Applications, registers it as a LaunchAgent so it
+    keeps a private copy of chat.db fresh, then opens the Full Disk Access
+    settings and shows the app in Finder: the user switches it on there.
+    """
+    steps = [
+        f"copy {HELPER_APP_NAME} to {HELPER_INSTALLED_APP}",
+        f"write {LAUNCH_AGENT} and load it with launchctl",
+        "open System Settings → Privacy & Security → Full Disk Access",
+        f"show {HELPER_INSTALLED_APP} in Finder",
+    ]
+    if not yes:
+        click.echo("DRY-RUN (nothing installed). Re-run with --yes to:")
+        for step in steps:
+            click.echo(f"  - {step}")
+        return
+    app = _bundled_app()
+    HELPER_INSTALLED_APP.parent.mkdir(parents=True, exist_ok=True)
+    if HELPER_INSTALLED_APP.exists():
+        shutil.rmtree(HELPER_INSTALLED_APP)
+    shutil.copytree(app, HELPER_INSTALLED_APP, symlinks=True)
+    # Archive extraction can drop the exec bit; the mode is not part of the signature.
+    (HELPER_INSTALLED_APP / "Contents" / "MacOS" / HELPER_EXECUTABLE).chmod(0o755)
+    HELPER_DIR.mkdir(parents=True, exist_ok=True)
+    HELPER_DIR.chmod(0o700)
+    LAUNCH_AGENT.parent.mkdir(parents=True, exist_ok=True)
+    LAUNCH_AGENT.write_bytes(plistlib.dumps(_launch_agent_plist()))
+    # bootstrap refuses a label that is already loaded, so a reinstall unloads first.
+    subprocess.run(
+        ["launchctl", "bootout", f"{_launchd_target()}/{HELPER_BUNDLE_ID}"],
+        capture_output=True,
+    )
+    result = subprocess.run(
+        ["launchctl", "bootstrap", _launchd_target(), str(LAUNCH_AGENT)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise click.ClickException(f"launchctl bootstrap failed: {result.stderr.strip()}")
+    subprocess.run(["open", FDA_PANE_URL], check=False)
+    subprocess.run(["open", "-R", str(HELPER_INSTALLED_APP)], check=False)
+    click.echo(f"Installed {HELPER_INSTALLED_APP} and started it.")
+    click.echo(
+        "Last step, in the Full Disk Access window that just opened: switch on "
+        "\"iMessage Reader\", or drag it from the Finder window into the list. "
+        "Then check with `imsg helper-status`."
+    )
+
+
+@cli.command("helper-uninstall", epilog="\b\nExamples:\n  imsg helper-uninstall\n  imsg helper-uninstall --yes")
+@click.option("--yes", is_flag=True, help="Uninstall. Without it, only list the steps.")
+def helper_uninstall(yes: bool) -> None:
+    """Stop and remove the iMessage Reader helper and its copy of chat.db."""
+    if not yes:
+        click.echo("DRY-RUN (nothing removed). Re-run with --yes to remove:")
+        for path in (LAUNCH_AGENT, HELPER_INSTALLED_APP, HELPER_DIR):
+            click.echo(f"  - {path}")
+        return
+    subprocess.run(
+        ["launchctl", "bootout", f"{_launchd_target()}/{HELPER_BUNDLE_ID}"],
+        capture_output=True,
+    )
+    LAUNCH_AGENT.unlink(missing_ok=True)
+    shutil.rmtree(HELPER_INSTALLED_APP, ignore_errors=True)
+    shutil.rmtree(HELPER_DIR, ignore_errors=True)
+    click.echo(
+        "Removed. Its Full Disk Access entry stays in System Settings until you "
+        "remove it there (select it, then −)."
+    )
+
+
+@cli.command("helper-status", epilog="\b\nExamples:\n  imsg helper-status\n  imsg helper-status --json")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def helper_status(as_json: bool) -> None:
+    """Whether messages are readable, directly or through the iMessage Reader helper."""
+    status = _helper_status()
+    status["next_step"] = _next_step(status)
+    if as_json:
+        click.echo(json.dumps(status, ensure_ascii=False))
+        return
+    age = status["copy_age_seconds"]
+    click.echo(f"ready:           {'yes' if status['ready'] else 'no'}")
+    click.echo(f"direct access:   {'yes' if status['direct_access'] else 'no'}")
+    click.echo(f"helper app:      {'installed' if status['app_installed'] else 'missing'}")
+    click.echo(f"launch agent:    {'running' if status['agent_loaded'] else 'not loaded'}")
+    click.echo(f"copy:            {'none' if age is None else f'written {age} s ago'}")
+    checked = status["helper_checked_seconds_ago"]
+    click.echo(f"helper checked:  {'never' if checked is None else f'{checked} s ago'}")
+    if status["helper_error"]:
+        click.echo(f"helper error:    {status['helper_error']}")
+    if status["next_step"]:
+        click.echo(f"next step:       {status['next_step']}")
 
 
 if __name__ == "__main__":

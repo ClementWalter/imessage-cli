@@ -12,3 +12,6 @@ __pycache__/
 # Built artifacts
 build/
 dist/
+
+# Helper app built by helper/build.py
+helper/dist/

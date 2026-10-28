@@ -7,8 +7,8 @@ description:
   message text. `imsg chats` lists conversations, `imsg read <name>` shows a
   thread, `imsg search <text>` searches across messages, `imsg send <name>
   <text>` sends one (dry-run unless `--yes`). Resolves contact names via the
-  Contacts framework. Requires Full Disk Access for the terminal app
-  (iTerm/Terminal). macOS only. Use when the user wants to read, search, or send
+  Contacts framework. Needs Full Disk Access for the terminal, or the iMessage
+  Reader helper (`imsg helper-install`) when run from Claude Desktop. macOS only. Use when the user wants to read, search, or send
   their personal iMessages/SMS."
 ---
 
@@ -42,17 +42,25 @@ permissions instead.
 
 ### Full Disk Access (one-time)
 
-`chat.db` is protected by macOS privacy (TCC). Grant the **app that runs the
-command** Full Disk Access: your terminal, or **Claude** when these tools are
-served to Claude Desktop or Cowork (the iMessage extension):
+`chat.db` is protected by macOS privacy (TCC), and the only grant that covers it
+is Full Disk Access. Two ways to provide it:
 
-1. System Settings → Privacy & Security → **Full Disk Access**
-2. Enable (or add with **+**) that app — e.g. **iTerm**, **Terminal** or **Claude**
-3. **Quit and relaunch** that app (required for it to take effect)
+- **Terminal**: give your terminal (iTerm, Terminal) Full Disk Access in System
+  Settings → Privacy & Security → **Full Disk Access**, then quit and relaunch
+  it. `imsg` then reads `chat.db` directly.
+- **Claude Desktop / Cowork** (the iMessage extension): do **not** grant Claude
+  Full Disk Access, it would extend to every extension and shell Claude runs.
+  Instead run `imsg helper-install --yes`. It installs **iMessage Reader**
+  (`~/Applications/iMessage Reader.app`, a background LaunchAgent), opens the
+  Full Disk Access pane and shows the app in Finder; the user switches on
+  "iMessage Reader" (or drags it into the list). The helper then keeps a copy
+  of `chat.db` in `~/Library/Application Support/imessage-cli/` (owner-only),
+  checked every 5 s and recopied at most every 30 s when it changed, and `imsg`
+  reads that copy whenever it cannot read `chat.db` itself. No restart needed.
 
-Until then every command fails with `authorization denied`. Contact-name
-resolution additionally uses Contacts access; without it, raw phone/email
-handles are shown instead (commands still work).
+`imsg helper-status` tells which path is active and the one next step if
+neither works. Contact-name resolution additionally uses Contacts access;
+without it, raw phone/email handles are shown instead (commands still work).
 
 ## Output conventions
 
@@ -72,8 +80,11 @@ handles are shown instead (commands still work).
 imsg chats [--limit N] [--json]                        # conversations, most recent first
 imsg read <query> [--limit N] [--match N] [--json]     # one thread (contact name, handle or group name)
 imsg search <text> [--limit N] [--json]                # substring search across all messages
+imsg helper-status [--json]                            # readable? direct or via the helper, next step
 # Write (dry-run unless --yes)
 imsg send <query> <text> [--match N] [--handle H] [--sms] [--yes]
+imsg helper-install [--yes]                            # install iMessage Reader, open Full Disk Access pane
+imsg helper-uninstall [--yes]                          # stop and remove it and its copy
 ```
 
 ### `imsg chats [--limit N] [--json]`
@@ -97,6 +108,21 @@ imsg read "Family" --limit 200
 ### `imsg search <text> [--limit N] [--json]`
 
 Full-text substring search across all messages.
+
+### `imsg helper-status [--json]`
+
+Whether messages are readable: `ready`, `direct_access`, the helper app and
+LaunchAgent, how long ago the helper last checked and wrote its copy, its last
+error (`no Full Disk Access: ...` until the user switches it on), and
+`next_step`, the one action that unblocks reading.
+
+### `imsg helper-install [--yes]` / `imsg helper-uninstall [--yes]`
+
+Set up (or remove) the iMessage Reader helper described under Full Disk Access.
+Dry run without `--yes`. After `helper-install --yes`, tell the user to switch
+on "iMessage Reader" in the Full Disk Access window that opened, then poll
+`helper-status` until `ready` is true. Reinstalling the same build keeps the
+grant; a rebuilt helper may need switching on again (ad hoc signature).
 
 ### `imsg send <query> <text> [--match N] [--handle H] [--sms] [--yes]`
 
@@ -135,8 +161,13 @@ imsg send "Jane Doe" "running late" --match 1 --yes
   instead of picking one. The list is most recent first, so for "the thread with
   X" pass `--match 1` from the start: `imsg read "Jane Doe" --match 1`. For
   `send`, read the list and pick the recipient deliberately.
-- Every command fails with `authorization denied` until the terminal app has
-  Full Disk Access **and was relaunched**.
+- Every read fails with "chat.db is not readable" until either the terminal has
+  Full Disk Access (and was relaunched) or the iMessage Reader helper is
+  installed and switched on: run `imsg helper-status` for the next step.
+- Through the helper, the newest messages can lag up to ~35 s behind.
+- Attachments live in `~/Library/Messages/Attachments`, which the helper does
+  not copy: without direct access, photos and files show as
+  `[attachment: unavailable]`.
 - Without Contacts access, raw phone/email handles are shown instead of names
   (commands still work).
 - A photo never downloaded from iCloud is skipped, not guessed at; open the
@@ -192,5 +223,6 @@ imessage-cli/
   README.md
   imessage_cli.py     # the CLI (PEP 723 script)
   bin/imsg            # symlink -> ../imessage_cli.py — invoke this
+  helper/             # iMessage Reader: Swift source, Info.plist, build.py
   tests/test_imsg.py  # offline tests against an in-memory chat.db
 ```

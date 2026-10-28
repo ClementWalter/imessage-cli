@@ -37,13 +37,18 @@ The `npx skills` install path additionally requires Node.js (for `npx`).
 
 ### Full Disk Access (one-time)
 
-`chat.db` is protected by macOS privacy (TCC). Grant the **terminal app that
-runs the command** Full Disk Access, or every command fails with
-`authorization denied`:
+`chat.db` is protected by macOS privacy (TCC), and Full Disk Access is the only
+grant that covers it. Either:
 
-1. System Settings → Privacy & Security → **Full Disk Access**
-2. Enable (or add with **+**) your terminal — e.g. **iTerm** or **Terminal**
-3. **Quit and relaunch** that terminal app (required for it to take effect)
+- **Terminal**: System Settings → Privacy & Security → **Full Disk Access**,
+  enable (or add with **+**) your terminal, e.g. **iTerm** or **Terminal**,
+  then quit and relaunch it. `imsg` reads `chat.db` directly.
+- **iMessage Reader helper** (Claude Desktop, or any app you would rather not
+  trust with Full Disk Access): `imsg helper-install --yes`, then switch on
+  **iMessage Reader** in the Full Disk Access pane it opens. See
+  [iMessage Reader helper](#imessage-reader-helper).
+
+`imsg helper-status` reports which path works and what to do next.
 
 ## Install
 
@@ -93,6 +98,8 @@ imsg send "alice" "running late" # dry-run: prints resolved recipient + text
 imsg send "alice" "running late" --yes        # actually sends (via Messages)
 imsg send "alice" "hi" --sms                  # over SMS instead of iMessage
 imsg send "alice" "hi" --handle +15555550123  # target an exact handle
+imsg helper-status               # readable? directly or through the helper
+imsg helper-install --yes        # install the iMessage Reader helper
 ```
 
 `imsg --help` lists every subcommand; `imsg <cmd> --help` for per-command
@@ -131,6 +138,52 @@ outbound action: it **defaults to a dry-run** and only sends with `--yes`.
   target is older than the window keeps its own line, quoting the message it
   answers (`😂 → "En bon père de famille"`).
 - **Timestamps** are converted from Apple absolute time to local time.
+
+## iMessage Reader helper
+
+Claude Desktop runs extensions as children of Claude.app, so macOS attributes
+their file access to Claude: granting Claude Full Disk Access would grant it to
+every extension and to the Claude Code / Cowork shells too. macOS has no
+narrower permission for `~/Library/Messages`, so a dedicated helper app holds
+it instead.
+
+- **What it is.** `helper/ImessageReader.swift` (~150 lines, no dependencies),
+  wrapped by `helper/build.py` into `iMessage Reader.app`
+  (`com.github.clementwalter.imessage-reader`, background-only) and signed ad
+  hoc. It reads `~/Library/Messages/chat.db` and writes only
+  `~/Library/Application Support/imessage-cli/` (mode 700): `chat.db` (600),
+  `status.json` and `helper.log`. No network, no other files.
+- **What it does.** Every 5 s it checks the database's mtime; when it changed
+  (and at most every 30 s) it copies it through the SQLite backup API into a
+  temp file, switches the copy out of WAL mode and renames it into place, so a
+  reader always sees a consistent database. `status.json` records the last
+  check, the last copy and the last error.
+- **How it runs.** `imsg helper-install --yes` copies the app to
+  `~/Applications`, writes `~/Library/LaunchAgents/<bundle id>.plist`
+  (RunAtLoad, KeepAlive) and loads it with `launchctl bootstrap gui/$UID`, then
+  opens the Full Disk Access pane and reveals the app in Finder. The user
+  switches it on; the helper retries every 5 s, so no restart is needed.
+  `imsg helper-uninstall --yes` undoes all of it except the Full Disk Access
+  entry, which only the user can remove.
+- **How imsg uses it.** `chat.db` itself is read when possible (a terminal with
+  Full Disk Access sees the live database); otherwise the helper's copy is
+  read, with a warning when the helper has stopped reporting.
+- **Building.** `uv run --script helper/build.py` (needs the Xcode command line
+  tools) writes `helper/dist/iMessage Reader.app`, a universal arm64/x86_64
+  build. `helper-install` uses that build, or builds it when it is missing and
+  `swiftc` exists.
+
+Limits: attachments are not copied, so without direct access photos and files
+show as unavailable. The copy holds your whole message history in clear, as
+readable as the original to any process running as you without sandboxing,
+which is the same exposure as `chat.db` minus the Full Disk Access gate.
+
+Ad hoc signing ties the Full Disk Access grant to the binary's hash: a rebuilt
+helper may show up as a new app and need switching on again. With a Developer
+ID certificate, `build.py` signs with `--sign "Developer ID Application: ..."
+--options runtime --timestamp`, the app is notarized (`xcrun notarytool submit
+--wait`) and stapled (`xcrun stapler staple`); the grant then follows the team
+ID and bundle ID across rebuilds, and Gatekeeper accepts the app on any Mac.
 
 ## Dependencies
 
