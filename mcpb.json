@@ -15,5 +15,6 @@
     "include": [
       "helper/dist/iMessage Reader.app"
     ]
-  }
+  },
+  "release": "local"
 }
