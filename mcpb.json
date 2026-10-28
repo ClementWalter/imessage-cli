@@ -1,0 +1,6 @@
+{
+  "display_name": "iMessage",
+  "description": "Read, search and send your iMessages and SMS from Claude.",
+  "long_description": "Reads the Messages history on this Mac and sends messages through the Messages app.\n\nSetup: macOS protects the Messages database. Open System Settings → Privacy & Security → Full Disk Access, switch on Claude, then quit and reopen Claude. Sending asks once for permission to control Messages.",
+  "platforms": ["darwin"]
+}
